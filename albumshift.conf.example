@@ -1,0 +1,28 @@
+# albumshift configuration
+# Copy to ~/.config/albumshift.conf
+
+# Album link. The source is detected from the link.
+#   Google Photos  https://photos.app.goo.gl/... or https://goo.gl/photos/...  (Share → Create link)
+#   iCloud         https://www.icloud.com/sharedalbum/#...  (Shared album → Public Website)
+#                  https://photos.icloud.com/shared/album/...
+#   Immich         https://immich.example.com/albums/<album-id>
+ALBUM_URL="https://photos.app.goo.gl/YOURLINK"
+
+# Immich only. Account Settings → API Keys, with asset.read and asset.view
+IMMICH_API_KEY=""
+
+# Photos downloaded per batch before a fresh random batch is pulled
+BATCH=10
+
+# Main monitor resolution (kscreen-doctor -o shows it)
+SCREEN_W=3840
+SCREEN_H=2160
+
+# Portrait photo handling
+#   skip  never show portraits
+#   blur  center the photo over a blurred, darkened fill of itself
+#   keep  show as-is
+PORTRAIT="blur"
+
+# Seconds between album re-index (6 hours)
+INDEX_TTL=21600

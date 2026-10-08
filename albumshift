@@ -1,0 +1,615 @@
+#!/usr/bin/env bash
+# Rotate the KDE Plasma wallpaper from a shared photo album
+# Sources  Google Photos shared album, iCloud shared album, Immich album
+# Developed with Claude (Anthropic), see README for details
+# Usage  albumshift [next|refresh|status]
+set -euo pipefail
+
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/albumshift.conf"
+STATE="${XDG_CACHE_HOME:-$HOME/.cache}/albumshift"
+
+# Defaults, override in the config file
+ALBUM_URL=""
+IMMICH_API_KEY=""        # only for Immich albums
+BATCH=10                 # photos per batch
+SCREEN_W=3840            # main monitor resolution
+SCREEN_H=2160
+PORTRAIT="blur"          # skip | blur | keep
+INDEX_TTL=21600          # seconds between album re-index (6 hours)
+
+[ -f "$CONF" ] && source "$CONF"
+[ -n "$ALBUM_URL" ] || { echo "Set ALBUM_URL in $CONF" >&2; exit 1; }
+command -v plasma-apply-wallpaperimage &>/dev/null || { echo "plasma-apply-wallpaperimage not found" >&2; exit 1; }
+command -v python3 &>/dev/null || { echo "python3 not found" >&2; exit 1; }
+
+if command -v magick &>/dev/null; then
+    IM=(magick); IDENT=(magick identify)
+elif command -v convert &>/dev/null; then
+    IM=(convert); IDENT=(identify)
+else
+    echo "ImageMagick not found, install with  sudo dnf install ImageMagick" >&2; exit 1
+fi
+
+export SCREEN_W SCREEN_H IMMICH_API_KEY
+
+INDEX="$STATE/index.tsv"          # ref <tab> width <tab> height
+SOURCE_FILE="$STATE/source-url"   # album the index was built from
+QUEUE="$STATE/queue.txt"
+CURRENT="$STATE/current"
+BATCH_DIR="$STATE/batch"
+mkdir -p "$BATCH_DIR"
+touch "$QUEUE"
+rm -f "$STATE/index.txt" "$STATE/portrait-skip.txt"   # files from older versions
+
+# Album indexing and downloading for each source
+#   index URL           prints  ref<TAB>width<TAB>height  per photo, videos skipped
+#   fetch URL REF OUT   downloads one photo to OUT
+#   source URL          prints the detected source
+PYHELPER=$(cat << 'PY'
+import base64, json, os, re, sys, urllib.error, urllib.parse, urllib.request
+
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+SCREEN_W = int(os.environ.get("SCREEN_W") or 3840)
+SCREEN_H = int(os.environ.get("SCREEN_H") or 2160)
+MAX_ITEMS = 20000
+
+
+def log(msg):
+    print(msg, file=sys.stderr)
+
+
+def request(url, data=None, headers=None, method=None):
+    h = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
+    h.update(headers or {})
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    return urllib.request.urlopen(req, timeout=60)
+
+
+def get_text(url, data=None, headers=None):
+    with request(url, data, headers) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def get_json(url, body=None, headers=None):
+    data = json.dumps(body).encode() if body is not None else None
+    with request(url, data, headers) as r:
+        return json.loads(r.read())
+
+
+def download(url, out, headers=None):
+    with request(url, headers=headers) as r, open(out, "wb") as f:
+        while True:
+            chunk = r.read(65536)
+            if not chunk:
+                break
+            f.write(chunk)
+    if os.path.getsize(out) == 0:
+        raise RuntimeError("empty download")
+
+
+def emit(ref, w, h):
+    w = int(w) if isinstance(w, (int, float)) else 0
+    h = int(h) if isinstance(h, (int, float)) else 0
+    print(f"{ref}\t{w}\t{h}")
+
+
+def detect(url):
+    u = url.lower()
+    if "photos.app.goo.gl" in u or "goo.gl/photos" in u or "photos.google.com" in u:
+        return "google"
+    if "icloud.com" in u:
+        return "icloud"
+    if re.search(r"/albums/[0-9a-f-]{36}", u):
+        return "immich"
+    sys.exit("Unrecognized ALBUM_URL, expected a Google Photos, iCloud, or Immich album link")
+
+
+# ---------------------------------------------------------------- Google Photos
+G_VIDEO_KEY = "76647426"
+G_SIZE_RE = re.compile(r"=[wh]\d+(?:-[a-z0-9]+)*$", re.I)
+
+
+def g_has_video(node, depth=0):
+    if depth > 6:
+        return False
+    if isinstance(node, dict):
+        return any(str(k) == G_VIDEO_KEY for k in node) or any(g_has_video(v, depth + 1) for v in node.values())
+    if isinstance(node, list):
+        return any(g_has_video(v, depth + 1) for v in node)
+    return False
+
+
+def g_parse_page(body):
+    for line in body.splitlines():
+        line = line.strip()
+        if not line.startswith("["):
+            continue
+        try:
+            outer = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for entry in outer:
+            if isinstance(entry, list) and len(entry) >= 3 and entry[0] == "wrb.fr" and isinstance(entry[2], str):
+                inner = json.loads(entry[2])
+                items = inner[1] if len(inner) > 1 and isinstance(inner[1], list) else []
+                nxt = inner[2] if len(inner) > 2 and isinstance(inner[2], str) and inner[2] else None
+                return items, nxt
+    return None, None
+
+
+def google_index(share):
+    html = get_text(share)
+    m = re.search(r'snAcKc[^}]*?request:\s*\[\s*"([A-Za-z0-9_-]+)"\s*,\s*null\s*,\s*null\s*,\s*"([A-Za-z0-9_-]+)"', html, re.S)
+    if not m:
+        sys.exit("Could not find album keys in Google share page")
+    album, auth = m.groups()
+    endpoint = ("https://photos.google.com/u/0/_/PhotosUi/data/batchexecute"
+                "?rpcids=snAcKc&source-path=/share/" + urllib.parse.quote(album))
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "Origin": "https://photos.google.com",
+        "Referer": f"https://photos.google.com/share/{album}?key={auth}",
+    }
+    seen, page, pages, videos = set(), None, 0, 0
+    while pages < 100 and len(seen) < MAX_ITEMS:
+        pages += 1
+        env = json.dumps([[["snAcKc", json.dumps([album, page, None, auth]), None, "generic"]]])
+        try:
+            body = get_text(endpoint, ("f.req=" + urllib.parse.quote(env)).encode(), headers)
+        except Exception as e:
+            log(f"Page {pages} failed, {e}")
+            break
+        items, page = g_parse_page(body)
+        if items is None:
+            break
+        added = 0
+        for raw in items:
+            if g_has_video(raw):
+                videos += 1
+                continue
+            if not isinstance(raw, list) or len(raw) < 2 or not isinstance(raw[1], list) or len(raw[1]) < 3:
+                continue
+            url = raw[1][0]
+            if not isinstance(url, str) or not url.startswith("http"):
+                continue
+            url = G_SIZE_RE.sub("", url)
+            if url in seen:
+                continue
+            seen.add(url)
+            added += 1
+            emit(url, raw[1][1], raw[1][2])
+        if not page or added == 0:
+            break
+    log(f"Google Photos, {len(seen)} photos in {pages} page(s), {videos} videos skipped")
+
+
+def google_fetch(share, ref, out):
+    download(f"{ref}=w{SCREEN_W}-h{SCREEN_H}", out)
+
+
+# ---------------------------------------------------------------------- iCloud
+BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+IC_TOKEN_CHARS = set(BASE62 + "-_")
+IC_HOST_RE = re.compile(r"p[0-9]+-sharedstreams\.icloud\.com")
+IC_HEADERS = {"Content-Type": "text/plain", "Origin": "https://www.icloud.com",
+              "Referer": "https://www.icloud.com/", "Accept": "application/json"}
+CK_CONTAINER = "com.apple.photos.cloud"
+CK_RECORD_TYPE = "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"
+CK_IMAGE_RES = (
+    ("resJPEGThumbRes", "resJPEGThumbWidth", "resJPEGThumbHeight"),
+    ("resJPEGMedRes", "resJPEGMedWidth", "resJPEGMedHeight"),
+    ("resJPEGLargeRes", "resJPEGLargeWidth", "resJPEGLargeHeight"),
+    ("resOriginalRes", "resOriginalWidth", "resOriginalHeight"),
+)
+CK_SAFE_ORIGINAL = {"public.jpeg", "public.png"}
+CK_VIDEO_HINTS = ("movie", "video", "mpeg-4", "quicktime")
+
+
+def ic_token(url):
+    text = url.strip()
+    if "#" in text:
+        text = text.rsplit("#", 1)[1]
+    elif "/" in text:
+        text = text.rstrip("/").rsplit("/", 1)[1]
+    token = text.split("?", 1)[0].strip()
+    if not token or not all(c in IC_TOKEN_CHARS for c in token):
+        sys.exit("Could not read the iCloud album token from ALBUM_URL")
+    return token
+
+
+def ic_is_cloudkit(url):
+    u = url.lower()
+    return "/shared/album/" in u or "photos.icloud.com" in u
+
+
+def b62(s):
+    n = 0
+    for c in s:
+        i = BASE62.find(c)
+        if i < 0:
+            return None
+        n = n * 62 + i
+    return n
+
+
+def ic_partition(token):
+    p = b62(token[1:2]) if token[0] == "A" else b62(token[1:3])
+    return f"p{p:02d}-sharedstreams.icloud.com" if p is not None else "p01-sharedstreams.icloud.com"
+
+
+def ic_post(token, path, body, host=None):
+    """POST to the legacy sharedstreams API, following one partition redirect."""
+    host = host or ic_partition(token)
+    for _ in range(2):
+        url = f"https://{host}/{token}/sharedstreams{path}"
+        try:
+            with request(url, json.dumps(body).encode(), IC_HEADERS) as r:
+                return json.loads(r.read()), host
+        except urllib.error.HTTPError as e:
+            if e.code != 330:
+                raise
+            target = e.headers.get("X-Apple-MMe-Host")
+            if not target:
+                try:
+                    target = json.loads(e.read()).get("X-Apple-MMe-Host")
+                except Exception:
+                    target = None
+            target = (target or "").strip().lower()
+            if not IC_HOST_RE.fullmatch(target) or target == host:
+                raise RuntimeError("iCloud partition redirect failed")
+            host = target
+    raise RuntimeError("iCloud partition redirect loop")
+
+
+def icloud_legacy_index(token):
+    payload, _ = ic_post(token, "/webstream", {"streamCtag": None})
+    photos = payload.get("photos") if isinstance(payload, dict) else None
+    count = videos = 0
+    for p in photos or []:
+        if not isinstance(p, dict) or not p.get("photoGuid"):
+            continue
+        if str(p.get("mediaAssetType", "")).lower() == "video":
+            videos += 1
+            continue
+        ders = p.get("derivatives")
+        if not isinstance(ders, dict) or not ders:
+            continue
+
+        def edge(item):
+            try:
+                return int(item[0])
+            except (TypeError, ValueError):
+                return int((item[1] or {}).get("fileSize") or 0) if isinstance(item[1], dict) else 0
+
+        key, d = max(ders.items(), key=edge)
+        if not isinstance(d, dict) or not d.get("checksum"):
+            continue
+        w = d.get("width") or p.get("width")
+        h = d.get("height") or p.get("height")
+        emit(f"{p['photoGuid']}|{d['checksum']}", int(w) if str(w).isdigit() else 0, int(h) if str(h).isdigit() else 0)
+        count += 1
+        if count >= MAX_ITEMS:
+            break
+    log(f"iCloud shared album, {count} photos, {videos} videos skipped")
+
+
+def icloud_legacy_fetch(token, ref, out):
+    guid, checksum = ref.split("|", 1)
+    payload, _ = ic_post(token, "/webasseturls", {"photoGuids": [guid]})
+    item = (payload.get("items") or {}).get(checksum) if isinstance(payload, dict) else None
+    if not isinstance(item, dict) or not item.get("url_location") or not item.get("url_path"):
+        raise RuntimeError("iCloud did not return an image URL")
+    download(f"{item.get('scheme') or 'https'}://{item['url_location']}{item['url_path']}", out)
+
+
+def ck_value(fields, name):
+    f = fields.get(name) if isinstance(fields, dict) else None
+    return f.get("value") if isinstance(f, dict) else None
+
+
+def icloud_ck_index(token):
+    url = (f"https://ckdatabasews.icloud.com/database/1/{CK_CONTAINER}/production"
+           f"/public/records/resolve?ckjsBuildVersion=2626&shortGUID={token}")
+    payload = get_json(url, {"shortGUIDs": [{"value": token}]}, IC_HEADERS)
+    results = payload.get("results") if isinstance(payload, dict) else None
+    if not results:
+        sys.exit("iCloud share link did not resolve to an album")
+    zone = results[0].get("zoneID")
+    access = results[0].get("anonymousPublicAccess") or {}
+    if not zone or not access.get("token") or not access.get("databasePartition"):
+        sys.exit("iCloud shared album is not publicly accessible")
+    query = urllib.parse.urlencode({
+        "remapEnums": "true", "getCurrentSyncToken": "true",
+        "sharing_url_key": token, "publicAccessAuthToken": access["token"],
+    })
+    qurl = f"{access['databasePartition']}/database/1/{CK_CONTAINER}/production/shared/records/query?{query}"
+
+    records, marker = [], None
+    while len(records) < MAX_ITEMS * 2:
+        body = {"zoneID": zone, "query": {"recordType": CK_RECORD_TYPE}, "resultsLimit": 200}
+        if marker:
+            body["continuationMarker"] = marker
+        page = get_json(qurl, body, IC_HEADERS)
+        batch = page.get("records") if isinstance(page, dict) else None
+        if not batch:
+            break
+        records.extend(batch)
+        marker = page.get("continuationMarker")
+        if not marker:
+            break
+
+    masters, assets = {}, []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("recordType") == "CPLMaster":
+            masters[rec.get("recordName")] = rec.get("fields") or {}
+        elif rec.get("recordType") == "CPLAsset":
+            assets.append(rec)
+
+    seen, videos = set(), 0
+    for asset in assets:
+        af = asset.get("fields") or {}
+        if ck_value(af, "isHidden") or ck_value(af, "trashReason"):
+            continue
+        ref = af.get("masterRef")
+        name = (ref.get("value") or {}).get("recordName") if isinstance(ref, dict) else None
+        mf = masters.get(name)
+        if not mf or name in seen:
+            continue
+        item_type = str(ck_value(mf, "itemType") or "").lower()
+        if any(v in item_type for v in CK_VIDEO_HINTS):
+            videos += 1
+            continue
+        best = None
+        for res_key, w_key, h_key in CK_IMAGE_RES:
+            val = (mf.get(res_key) or {}).get("value") if isinstance(mf.get(res_key), dict) else None
+            if not isinstance(val, dict) or not val.get("downloadURL"):
+                continue
+            if res_key == "resOriginalRes" and item_type not in CK_SAFE_ORIGINAL:
+                continue
+            w, h = ck_value(mf, w_key), ck_value(mf, h_key)
+            rank = int(w) if isinstance(w, (int, float)) else 0
+            if best is None or rank >= best[0]:
+                best = (rank, val["downloadURL"], w, h)
+        if not best:
+            continue
+        fname = "image.jpg"
+        enc = ck_value(mf, "filenameEnc")
+        if isinstance(enc, str) and enc:
+            try:
+                fname = base64.b64decode(enc).decode("utf-8", "replace")
+            except Exception:
+                pass
+        seen.add(name)
+        emit(best[1].replace("${f}", urllib.parse.quote(fname, safe="")), best[2], best[3])
+    log(f"iCloud shared album, {len(seen)} photos, {videos} videos skipped")
+
+
+def icloud_index(url):
+    token = ic_token(url)
+    (icloud_ck_index if ic_is_cloudkit(url) else icloud_legacy_index)(token)
+
+
+def icloud_fetch(url, ref, out):
+    if ic_is_cloudkit(url):
+        download(ref, out)
+    else:
+        icloud_legacy_fetch(ic_token(url), ref, out)
+
+
+# ---------------------------------------------------------------------- Immich
+def immich_parts(url):
+    m = re.search(r"^(https?://.+?)/albums/([0-9a-fA-F-]{36})", url.strip())
+    if not m:
+        sys.exit("Could not read the Immich server and album id from ALBUM_URL")
+    key = os.environ.get("IMMICH_API_KEY", "")
+    if not key:
+        sys.exit("Set IMMICH_API_KEY in the config for Immich albums")
+    return m.group(1).rstrip("/"), m.group(2), {"x-api-key": key, "Accept": "application/json"}
+
+
+def immich_index(url):
+    base, album, headers = immich_parts(url)
+    headers = dict(headers, **{"Content-Type": "application/json"})
+    page, count = 1, 0
+    while page and count < MAX_ITEMS:
+        payload = get_json(f"{base}/api/search/metadata",
+                           {"albumIds": [album], "type": "IMAGE", "size": 1000, "page": page}, headers)
+        assets = payload.get("assets") if isinstance(payload, dict) else None
+        if not isinstance(assets, dict):
+            break
+        for it in assets.get("items") or []:
+            if not isinstance(it, dict) or not it.get("id"):
+                continue
+            if str(it.get("type", "")).upper() != "IMAGE" or it.get("isTrashed") or it.get("isArchived"):
+                continue
+            emit(it["id"], it.get("width"), it.get("height"))
+            count += 1
+        nxt = assets.get("nextPage")
+        page = int(nxt) if isinstance(nxt, (int, str)) and str(nxt).isdigit() else None
+    log(f"Immich album, {count} photos")
+
+
+def immich_fetch(url, ref, out):
+    base, _, headers = immich_parts(url)
+    last = None
+    for size in ("fullsize", "preview"):
+        try:
+            download(f"{base}/api/assets/{ref}/thumbnail?size={size}", out, {"x-api-key": headers["x-api-key"]})
+            return
+        except Exception as e:
+            last = e
+    raise last
+
+
+# ------------------------------------------------------------------------ main
+SOURCES = {
+    "google": (google_index, google_fetch),
+    "icloud": (icloud_index, icloud_fetch),
+    "immich": (immich_index, immich_fetch),
+}
+
+
+def main():
+    if len(sys.argv) < 3 or sys.argv[1] not in ("index", "fetch", "source"):
+        sys.exit("Usage  helper index URL | fetch URL REF OUT | source URL")
+    cmd, url = sys.argv[1], sys.argv[2]
+    src = detect(url)
+    if cmd == "source":
+        print(src)
+    elif cmd == "index":
+        SOURCES[src][0](url)
+    else:
+        try:
+            SOURCES[src][1](url, sys.argv[3], sys.argv[4])
+        except SystemExit:
+            raise
+        except Exception as e:
+            sys.exit(f"Download failed, {e}")
+
+
+main()
+PY
+)
+
+helper() {
+    python3 -I -c "$PYHELPER" "$@"
+}
+
+index_stale() {
+    [ -s "$INDEX" ] || return 0
+    # Album changed in the config
+    [ "$(cat "$SOURCE_FILE" 2>/dev/null)" = "$ALBUM_URL" ] || return 0
+    [ $(( $(date +%s) - $(stat -c %Y "$INDEX") )) -ge "$INDEX_TTL" ]
+}
+
+refresh_index() {
+    local tmp
+    tmp=$(mktemp)
+    if helper index "$ALBUM_URL" > "$tmp" && [ -s "$tmp" ]; then
+        mv "$tmp" "$INDEX"
+        printf '%s\n' "$ALBUM_URL" > "$SOURCE_FILE"
+        : > "$QUEUE"
+        echo "Indexed $(wc -l < "$INDEX") photos"
+    else
+        rm -f "$tmp"
+        [ -s "$INDEX" ] || { echo "Could not read album and no cached index" >&2; exit 1; }
+        echo "Album fetch failed, using cached index"
+    fi
+}
+
+# Center the full photo over a blurred, darkened fill of itself
+blur_fill() {
+    local src="$1" dst="$2" geo="${SCREEN_W}x${SCREEN_H}"
+    "${IM[@]}" "${src}[0]" \
+        \( -clone 0 -resize "${geo}^" -gravity center -extent "$geo" \
+           -resize 5% -blur 0x4 -resize "${geo}!" -modulate 65 \) \
+        \( -clone 0 -resize "$geo" \) \
+        -delete 0 -gravity center -composite -quality 92 "$dst"
+}
+
+# Download one batch. Returns non-zero if nothing usable was downloaded.
+download_batch() {
+    local cur="" ref w h id f count=0
+    [ -f "$CURRENT" ] && cur=$(<"$CURRENT")
+
+    # Clear the old batch but keep the file currently on screen
+    find "$BATCH_DIR" -maxdepth 1 -type f ! -path "$cur" -delete
+    : > "$QUEUE"
+
+    while IFS=$'\t' read -r ref w h; do
+        [ "$count" -ge "$BATCH" ] && break
+
+        # Skip known portraits before downloading
+        if [ "$PORTRAIT" = "skip" ] && [ "${w:-0}" -gt 0 ] && [ "${h:-0}" -ge "$w" ]; then
+            continue
+        fi
+
+        id=$(printf '%s' "$ref" | sha1sum | cut -c1-16)
+        f="$BATCH_DIR/$id.jpg"
+        [ "$f" = "$cur" ] && continue
+
+        if ! helper fetch "$ALBUM_URL" "$ref" "$f.part" 2>/dev/null; then
+            rm -f "$f.part"
+            continue
+        fi
+
+        # Read real dimensions from the file (handles missing or rotated index sizes)
+        read -r w h < <("${IDENT[@]}" -auto-orient -format '%w %h\n' "$f.part[0]" 2>/dev/null) \
+            || { rm -f "$f.part"; continue; }
+
+        if [ "$h" -ge "$w" ]; then
+            case "$PORTRAIT" in
+                skip)
+                    rm -f "$f.part"
+                    continue
+                    ;;
+                blur)
+                    blur_fill "$f.part" "$f" || { rm -f "$f.part" "$f"; continue; }
+                    rm -f "$f.part"
+                    ;;
+                *)
+                    mv "$f.part" "$f"
+                    ;;
+            esac
+        else
+            mv "$f.part" "$f"
+        fi
+
+        echo "$f" >> "$QUEUE"
+        count=$((count + 1))
+    done < <(shuf "$INDEX")
+
+    [ "$count" -gt 0 ] || return 1
+    echo "Downloaded batch of $count"
+}
+
+fill_batch() {
+    download_batch && return 0
+    # Every download failed, image links may have expired (iCloud), so re-index once
+    echo "Batch download failed, re-indexing album"
+    refresh_index
+    download_batch || { echo "No usable photos downloaded" >&2; exit 1; }
+}
+
+apply_next() {
+    local next=""
+    while [ -z "$next" ] || [ ! -f "$next" ]; do
+        [ -s "$QUEUE" ] || fill_batch
+        next=$(head -n1 "$QUEUE")
+        sed -i '1d' "$QUEUE"
+    done
+    plasma-apply-wallpaperimage "$next" >/dev/null
+    echo "$next" > "$CURRENT"
+    echo "Wallpaper set to $(basename "$next"), $(wc -l < "$QUEUE") left in batch"
+}
+
+case "${1:-next}" in
+    next)
+        index_stale && refresh_index
+        apply_next
+        ;;
+    refresh)
+        refresh_index
+        fill_batch
+        apply_next
+        ;;
+    status)
+        echo "Source           $(helper source "$ALBUM_URL" 2>&1)"
+        if [ -s "$INDEX" ]; then
+            awk -F'\t' '{ if ($2 > 0 && $3 >= $2) p++; else if ($2 > 0) l++; else u++ }
+                END { printf "Album photos     %d (%d landscape, %d portrait, %d unknown)\n", NR, l, p, u }' "$INDEX"
+        else
+            echo "Album photos     0"
+        fi
+        echo "Left in batch    $(wc -l < "$QUEUE")"
+        echo "Portrait mode    $PORTRAIT"
+        echo "Current          $( [ -f "$CURRENT" ] && basename "$(<"$CURRENT")" || echo none)"
+        ;;
+    *)
+        echo "Usage albumshift [next|refresh|status]" >&2
+        exit 1
+        ;;
+esac

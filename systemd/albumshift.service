@@ -1,0 +1,7 @@
+[Unit]
+Description=Rotate wallpaper from Google Photos album
+After=network-online.target graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/albumshift next
